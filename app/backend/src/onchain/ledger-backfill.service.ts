@@ -109,7 +109,12 @@ export class LedgerBackfillService {
     dryRun: boolean = false,
   ): Promise<BackfillResult | DryRunResult> {
     if (dryRun) {
-      return this.previewBackfill(startLedger, endLedger, campaignId, batchSize);
+      return this.previewBackfill(
+        startLedger,
+        endLedger,
+        campaignId,
+        batchSize,
+      );
     }
 
     const jobKey = buildJobKey(startLedger, endLedger, campaignId);
@@ -352,7 +357,10 @@ export class LedgerBackfillService {
     let wouldCreateCount = 0;
     let wouldSkipCount = 0;
 
-    const record = (entries: DetectedLedgerEntry[], action: 'create' | 'skip') => {
+    const record = (
+      entries: DetectedLedgerEntry[],
+      action: 'create' | 'skip',
+    ) => {
       for (const entry of entries) {
         const bucket = (byEntityType[entry.eventType] ??= {
           toCreate: 0,
@@ -540,7 +548,10 @@ export class LedgerBackfillService {
     startLedger: number,
     endLedger: number,
     campaignId?: string,
-  ): Promise<{ toCreate: DetectedLedgerEntry[]; toSkip: DetectedLedgerEntry[] }> {
+  ): Promise<{
+    toCreate: DetectedLedgerEntry[];
+    toSkip: DetectedLedgerEntry[];
+  }> {
     // Check for existing ledger entries to ensure idempotency.
     const existingEntries = await this.prisma.balanceLedger.findMany({
       where: {
