@@ -29,6 +29,12 @@ import {
   StorageQuotaStatus,
 } from '../services/storageQuota';
 import { structuredLogger } from '../services/logger';
+import {
+  E2E_EVIDENCE_IMAGE_BASE64,
+  E2E_EVIDENCE_IMAGE_DATA_URI,
+  E2E_SIMULATE_CAPTURE_LABEL,
+  isE2ETestModeEnabled,
+} from '../e2e/testMode';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'EvidenceUpload'>;
 
@@ -186,6 +192,21 @@ export const EvidenceUploadScreen: React.FC<Props> = ({
     setSelectedImageUri(result.uri);
     setCompressedBase64(result.base64);
     setFilename(`evidence-${Date.now()}.jpg`);
+  }, []);
+
+  /**
+   * E2E-only: populate the capture pipeline with a bundled image so the
+   * queue/upload steps can be driven on an emulator, where the native
+   * camera and photo picker cannot be automated. Gated behind the E2E
+   * build switch (`src/e2e/e2eBuildFlag.ts`); never rendered in production
+   * (issue #932).
+   */
+  const useFixtureEvidence = useCallback(() => {
+    setSelectedImageUri(E2E_EVIDENCE_IMAGE_DATA_URI);
+    setCompressedBase64(E2E_EVIDENCE_IMAGE_BASE64);
+    setFilename('e2e-evidence.jpg');
+    setStatusMessage(null);
+    setError(null);
   }, []);
 
   const pickImage = useCallback(async () => {
@@ -364,6 +385,7 @@ export const EvidenceUploadScreen: React.FC<Props> = ({
             onPress={takePhoto}
             accessibilityRole="button"
             accessibilityLabel="Take a photo of evidence"
+            testID="take-photo-button"
             activeOpacity={0.8}
           >
             <Text style={styles.buttonText}>{t('evidence.takePhoto')}</Text>
@@ -373,10 +395,23 @@ export const EvidenceUploadScreen: React.FC<Props> = ({
             onPress={pickImage}
             accessibilityRole="button"
             accessibilityLabel="Select an evidence photo from your library"
+            testID="select-photo-button"
             activeOpacity={0.8}
           >
             <Text style={styles.secondaryButtonText}>{t('evidence.selectPhoto')}</Text>
           </TouchableOpacity>
+          {isE2ETestModeEnabled() ? (
+            <TouchableOpacity
+              style={[styles.button, styles.e2eButton]}
+              onPress={useFixtureEvidence}
+              accessibilityRole="button"
+              accessibilityLabel="E2E simulate evidence capture"
+              testID="e2e-simulate-capture"
+              activeOpacity={0.8}
+            >
+              <Text style={styles.e2eButtonText}>{E2E_SIMULATE_CAPTURE_LABEL}</Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
       </View>
 
@@ -407,11 +442,25 @@ export const EvidenceUploadScreen: React.FC<Props> = ({
         <Text style={styles.helpText}>
           Compressed image upload saves data on low-bandwidth connections.
         </Text>
+        {/*
+          The upload outcome is rendered *above* the button, not below it.
+          The app draws edge-to-edge, so the tail of a phone-sized form sits
+          under the system navigation bar (the same reason the scanner's
+          overlay overflows) — copy appended after the button can end up
+          behind the bar and be invisible to the user, the accessibility
+          tree and the E2E flows. Above the button it shares the space the
+          button itself is scrolled into.
+        */}
+        {statusMessage ? (
+          <Text style={styles.statusText}>{statusMessage}</Text>
+        ) : null}
+        {error ? <Text style={styles.errorText}>{error}</Text> : null}
         <TouchableOpacity
           style={[styles.button, styles.primaryButton]}
           onPress={handleUpload}
           disabled={!compressedBase64 || uploading || !!activeUpload}
           accessibilityRole="button"
+          testID="upload-evidence-button"
           accessibilityLabel={
             uploading ? 'Uploading evidence' : 'Upload evidence now'
           }
@@ -427,10 +476,6 @@ export const EvidenceUploadScreen: React.FC<Props> = ({
             <Text style={styles.buttonText}>{t('aidDetails.uploadEvidence')}</Text>
           )}
         </TouchableOpacity>
-        {statusMessage ? (
-          <Text style={styles.statusText}>{statusMessage}</Text>
-        ) : null}
-        {error ? <Text style={styles.errorText}>{error}</Text> : null}
         {activeUpload ? (
           <View style={styles.queueCard}>
             <View style={styles.queueHeader}>
@@ -508,6 +553,10 @@ const makeStyles = (colors: any) =>
     },
     content: {
       padding: 20,
+      // Clears the system navigation bar (48dp on the CI emulator) so the
+      // trailing offline notice can be scrolled fully into view instead of
+      // ending up behind it.
+      paddingBottom: 96,
       gap: 18,
     },
     header: {
@@ -570,6 +619,16 @@ const makeStyles = (colors: any) =>
       fontSize: 16,
       fontWeight: '700',
     },
+    e2eButton: {
+      backgroundColor: '#FEF3C7',
+      borderWidth: 1,
+      borderColor: '#F59E0B',
+    },
+    e2eButtonText: {
+      color: '#92400E',
+      fontSize: 15,
+      fontWeight: '700',
+    },
     previewImage: {
       width: '100%',
       aspectRatio: 4 / 3,
@@ -582,12 +641,10 @@ const makeStyles = (colors: any) =>
       marginTop: 8,
     },
     statusText: {
-      marginTop: 12,
       fontSize: 14,
       color: colors.info,
     },
     errorText: {
-      marginTop: 12,
       fontSize: 14,
       color: colors.error,
     },
