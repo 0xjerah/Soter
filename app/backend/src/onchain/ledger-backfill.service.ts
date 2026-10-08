@@ -1,7 +1,16 @@
-import { Injectable, Logger, ConflictException } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  ConflictException,
+  NotImplementedException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
+import {
+  OnChainLedgerEntry,
+  StellarLedgerSource,
+} from './stellar-ledger-source';
 
 export interface BackfillJobData {
   startLedger: number;
@@ -25,29 +34,32 @@ export interface BackfillResult {
   resumeFrom?: number;
 }
 
-/** A single ledger entry as detected from the on-chain source, prior to persistence. */
-interface DetectedLedgerEntry {
+/** A `BalanceLedger` row the backfill would insert. */
+interface PlannedLedgerRow {
   id: string;
-  campaignId?: string;
-  claimId?: string;
+  campaignId: string;
+  claimId: null;
   eventType: string;
   amount: number;
-  note?: string;
+  note: string;
   createdAt: Date;
 }
 
+export type DryRunAction = 'create' | 'skip' | 'unattributable';
+
 export interface DryRunSampleRecord {
   id: string;
-  campaignId?: string;
-  claimId?: string;
+  ledger: number;
   eventType: string;
   amount: number;
-  action: 'create' | 'skip';
+  txHash: string;
+  action: DryRunAction;
 }
 
 export interface DryRunEntityBreakdown {
   toCreate: number;
   toSkip: number;
+  unattributable: number;
 }
 
 export interface DryRunResult {
@@ -58,6 +70,8 @@ export interface DryRunResult {
   totalCount: number;
   wouldCreateCount: number;
   wouldSkipCount: number;
+  /** Entries a real run would refuse to store (no campaignId); non-zero means the real run would fail. */
+  unattributableCount: number;
   /** Counts grouped by ledger entry `eventType` (e.g. lock / unlock / disburse). */
   byEntityType: Record<string, DryRunEntityBreakdown>;
   /** A capped sample of affected records for operator review. */
@@ -87,6 +101,7 @@ export class LedgerBackfillService {
   constructor(
     private readonly prisma: PrismaService,
     @InjectQueue('onchain') private readonly onchainQueue: Queue,
+    private readonly ledgerSource: StellarLedgerSource,
   ) {}
 
   /**
@@ -99,6 +114,10 @@ export class LedgerBackfillService {
    * - If a `completed` checkpoint exists, the existing result is returned directly.
    * - If `dryRun` is true, nothing is persisted or enqueued: the same read/detection
    *   logic used by the real run is used to report what it *would* do instead.
+   *
+   * Refuses to start when no live on-chain source is configured: a backfill
+   * with nothing to copy would record zero movements and report success, which
+   * is indistinguishable from a genuinely complete range.
    */
   async triggerBackfill(
     startLedger: number,
@@ -108,6 +127,13 @@ export class LedgerBackfillService {
     triggeredBy?: string,
     dryRun: boolean = false,
   ): Promise<BackfillResult | DryRunResult> {
+    if (!this.ledgerSource.isEnabled()) {
+      throw new NotImplementedException(
+        `Backfill is not available against live data: ${this.ledgerSource.describeUnavailable()} ` +
+          'Configure AID_ESCROW_CONTRACT_ID with STELLAR_RPC_URL / STELLAR_HORIZON_URL before backfilling.',
+      );
+    }
+
     if (dryRun) {
       return this.previewBackfill(
         startLedger,
@@ -121,7 +147,7 @@ export class LedgerBackfillService {
     const totalCount = endLedger - startLedger + 1;
 
     this.logger.log(
-      `[backfill] Trigger request — range=${startLedger}-${endLedger} key=${jobKey}`,
+      `[backfill] Trigger request — range=${startLedger}-${endLedger} key=${jobKey} source=${this.ledgerSource.sourceKind}`,
     );
 
     // Look up an existing checkpoint for this range.
@@ -354,52 +380,52 @@ export class LedgerBackfillService {
 
     const byEntityType: Record<string, DryRunEntityBreakdown> = {};
     const sample: DryRunSampleRecord[] = [];
-    let wouldCreateCount = 0;
-    let wouldSkipCount = 0;
+    const counts: Record<DryRunAction, number> = {
+      create: 0,
+      skip: 0,
+      unattributable: 0,
+    };
+    const bucketKey = {
+      create: 'toCreate',
+      skip: 'toSkip',
+      unattributable: 'unattributable',
+    } as const;
 
-    const record = (
-      entries: DetectedLedgerEntry[],
-      action: 'create' | 'skip',
-    ) => {
-      for (const entry of entries) {
-        const bucket = (byEntityType[entry.eventType] ??= {
-          toCreate: 0,
-          toSkip: 0,
+    const record = (entry: OnChainLedgerEntry, action: DryRunAction) => {
+      counts[action]++;
+      const bucket = (byEntityType[entry.eventType] ??= {
+        toCreate: 0,
+        toSkip: 0,
+        unattributable: 0,
+      });
+      bucket[bucketKey[action]]++;
+
+      if (sample.length < DRY_RUN_SAMPLE_SIZE) {
+        sample.push({
+          id: entry.id,
+          ledger: entry.ledger,
+          eventType: entry.eventType,
+          amount: entry.amount,
+          txHash: entry.txHash,
+          action,
         });
-        if (action === 'create') {
-          bucket.toCreate++;
-        } else {
-          bucket.toSkip++;
-        }
-
-        if (sample.length < DRY_RUN_SAMPLE_SIZE) {
-          sample.push({
-            id: entry.id,
-            campaignId: entry.campaignId,
-            claimId: entry.claimId,
-            eventType: entry.eventType,
-            amount: entry.amount,
-            action,
-          });
-        }
       }
     };
 
     for (let ledger = startLedger; ledger <= endLedger; ledger += batchSize) {
       const batchEnd = Math.min(ledger + batchSize - 1, endLedger);
-      const { toCreate, toSkip } = await this.detectLedgerRange(
+      const { toCreate, toSkip, unattributable } = await this.detectLedgerRange(
         ledger,
         batchEnd,
         campaignId,
       );
-      wouldCreateCount += toCreate.length;
-      wouldSkipCount += toSkip.length;
-      record(toCreate, 'create');
-      record(toSkip, 'skip');
+      toCreate.forEach(({ entry }) => record(entry, 'create'));
+      toSkip.forEach(e => record(e, 'skip'));
+      unattributable.forEach(e => record(e, 'unattributable'));
     }
 
     this.logger.log(
-      `[backfill] Dry-run complete — key=${jobKey} wouldCreate=${wouldCreateCount} wouldSkip=${wouldSkipCount}`,
+      `[backfill] Dry-run complete — key=${jobKey} wouldCreate=${counts.create} wouldSkip=${counts.skip} unattributable=${counts.unattributable}`,
     );
 
     return {
@@ -408,8 +434,9 @@ export class LedgerBackfillService {
       startLedger,
       endLedger,
       totalCount,
-      wouldCreateCount,
-      wouldSkipCount,
+      wouldCreateCount: counts.create,
+      wouldSkipCount: counts.skip,
+      unattributableCount: counts.unattributable,
       byEntityType,
       sample,
     };
@@ -511,24 +538,22 @@ export class LedgerBackfillService {
     endLedger: number,
     campaignId?: string,
   ): Promise<{ processed: number; skipped: number }> {
-    const { toCreate, toSkip } = await this.detectLedgerRange(
+    const { toCreate, toSkip, unattributable } = await this.detectLedgerRange(
       startLedger,
       endLedger,
       campaignId,
     );
 
-    for (const entry of toCreate) {
-      await this.prisma.balanceLedger.create({
-        data: {
-          id: entry.id,
-          campaignId: entry.campaignId ?? campaignId,
-          claimId: entry.claimId,
-          eventType: entry.eventType,
-          amount: entry.amount,
-          note: entry.note,
-          createdAt: entry.createdAt,
-        },
-      });
+    for (const { row } of toCreate) {
+      await this.prisma.balanceLedger.create({ data: row });
+    }
+
+    if (unattributable.length > 0) {
+      throw new Error(
+        `Ledgers ${startLedger}-${endLedger}: ${unattributable.length} on-chain movement(s) cannot be stored without a campaignId ` +
+          '(BalanceLedger.campaignId is required and the contract event stream carries no campaign attribution). ' +
+          'Re-run the backfill with a campaignId.',
+      );
     }
 
     this.logger.debug(
@@ -540,17 +565,17 @@ export class LedgerBackfillService {
 
   /**
    * Shared read/detection logic used by both the real run (`processLedgerRange`)
-   * and the dry-run preview (`previewBackfill`). Determines which on-chain ledger
-   * entries in the range are new (would be created) vs. already present (would be
-   * skipped) without writing anything, so preview and reality cannot drift apart.
+   * and the dry-run preview (`previewBackfill`), so preview and reality cannot
+   * drift apart. Classifies each on-chain entry without writing anything.
    */
   private async detectLedgerRange(
     startLedger: number,
     endLedger: number,
     campaignId?: string,
   ): Promise<{
-    toCreate: DetectedLedgerEntry[];
-    toSkip: DetectedLedgerEntry[];
+    toCreate: { entry: OnChainLedgerEntry; row: PlannedLedgerRow }[];
+    toSkip: OnChainLedgerEntry[];
+    unattributable: OnChainLedgerEntry[];
   }> {
     // Check for existing ledger entries to ensure idempotency.
     const existingEntries = await this.prisma.balanceLedger.findMany({
@@ -564,36 +589,57 @@ export class LedgerBackfillService {
 
     const existingIds = new Set(existingEntries.map(e => e.id));
 
-    // Fetch ledger data from on-chain (stubbed; real impl calls Horizon API).
-    const ledgerData = this.fetchLedgerRange(startLedger, endLedger);
+    // Genuine on-chain data, read through the shared Stellar client. Throws
+    // rather than yielding an empty range, so an unreachable node fails the
+    // batch instead of quietly skipping the whole window.
+    const ledgerData = await this.ledgerSource.fetchLedgerEntries({
+      startLedger,
+      endLedger,
+    });
 
-    const toCreate: DetectedLedgerEntry[] = [];
-    const toSkip: DetectedLedgerEntry[] = [];
+    const toCreate: { entry: OnChainLedgerEntry; row: PlannedLedgerRow }[] = [];
+    const toSkip: OnChainLedgerEntry[] = [];
+    const unattributable: OnChainLedgerEntry[] = [];
 
     for (const entry of ledgerData) {
-      const detected: DetectedLedgerEntry = {
-        id: entry.id,
-        campaignId: entry.campaignId ?? campaignId,
-        claimId: entry.claimId,
-        eventType: entry.eventType,
-        amount: entry.amount,
-        note: entry.note,
-        createdAt: entry.createdAt,
-      };
-
       if (existingIds.has(entry.id)) {
-        toSkip.push(detected);
-      } else {
-        toCreate.push(detected);
+        toSkip.push(entry);
+        continue;
       }
+
+      // `BalanceLedger.campaignId` is a required foreign key and the on-chain
+      // event stream carries no campaign attribution (see EVENTS.md), so a
+      // range backfilled without a campaign cannot be persisted. Surfacing that
+      // as an unattributable entry keeps the rows honest instead of inventing a
+      // campaign they never belonged to.
+      if (!campaignId) {
+        unattributable.push(entry);
+        continue;
+      }
+
+      toCreate.push({
+        entry,
+        row: {
+          id: entry.id,
+          campaignId,
+          claimId: null,
+          eventType: entry.eventType,
+          amount: entry.amount,
+          note: this.buildNote(entry),
+          createdAt: entry.createdAt,
+        },
+      });
     }
 
-    return { toCreate, toSkip };
+    return { toCreate, toSkip, unattributable };
   }
 
-  /** Placeholder for a real Stellar Horizon API call. */
-  private fetchLedgerRange(_startLedger: number, _endLedger: number): any[] {
-    return [];
+  /** Provenance string stored alongside every backfilled row. */
+  private buildNote(entry: OnChainLedgerEntry): string {
+    return (
+      `onchain:${entry.source} ledger=${entry.ledger} tx=${entry.txHash}` +
+      (entry.packageId ? ` package=${entry.packageId}` : '')
+    );
   }
 
   private mapJobStateToStatus(state: string): BackfillResult['status'] {
